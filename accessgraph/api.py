@@ -6,11 +6,12 @@ from contextlib import asynccontextmanager
 from typing import Literal
 
 import redis
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from psycopg.errors import QueryCanceled
 from pydantic import BaseModel, Field, model_validator
 
 from accessgraph.db import connect, init
-from accessgraph.graph import check, creates_cycle
+from accessgraph.repository import evaluate, would_cycle
 
 
 @asynccontextmanager
@@ -20,9 +21,14 @@ async def lifespan(app):
 
 
 def authorize(x_api_key: str = Header(default="")):
-    key = os.environ.get("API_KEY", "")
-    if not key or not secrets.compare_digest(x_api_key, key):
-        raise HTTPException(401, "Неверный API-ключ")
+    configured = json.loads(os.environ.get("TENANT_KEYS", "{}"))
+    fallback = os.environ.get("API_KEY", "")
+    if fallback:
+        configured.setdefault("default", fallback)
+    for tenant, key in configured.items():
+        if key and secrets.compare_digest(x_api_key, key):
+            return tenant
+    raise HTTPException(401, "Неверный API-ключ")
 
 
 app = FastAPI(title="AccessGraph", lifespan=lifespan, dependencies=[Depends(authorize)])
@@ -30,7 +36,7 @@ app = FastAPI(title="AccessGraph", lifespan=lifespan, dependencies=[Depends(auth
 
 class Edge(BaseModel):
     resource: str = Field(pattern=r"^(folder|document|team):[a-zA-Z0-9_-]{1,80}$")
-    relation: Literal["owner", "editor", "parent", "member"]
+    relation: Literal["owner", "editor", "viewer", "parent", "member"]
     subject: str = Field(pattern=r"^(folder|team|user):[a-zA-Z0-9_-]{1,80}$")
 
     @model_validator(mode="after")
@@ -38,7 +44,7 @@ class Edge(BaseModel):
         resource = self.resource.split(":")[0]
         subject = self.subject.split(":")[0]
         if self.relation == "member":
-            valid = resource == "team" and subject == "user"
+            valid = resource == "team" and subject in {"user", "team"}
         elif self.relation == "parent":
             valid = resource in {"folder", "document"} and subject == "folder"
         else:
@@ -49,6 +55,8 @@ class Edge(BaseModel):
 
 
 class Checks(BaseModel):
+    permission: Literal["view", "edit", "manage"] = "view"
+    min_revision: int = Field(default=0, ge=0)
     user: str = Field(pattern=r"^user:[a-zA-Z0-9_-]{1,80}$")
     resources: list[str] = Field(min_length=1, max_length=100)
 
@@ -64,47 +72,83 @@ class Checks(BaseModel):
         return self
 
 
-def mutate(edge, remove=False):
-    with connect() as conn:
-        revision = conn.execute("SELECT value FROM revision WHERE singleton FOR UPDATE").fetchone()[
-            "value"
-        ]
-        values = (edge.resource, edge.relation, edge.subject)
-        if remove:
-            result = conn.execute(
-                "DELETE FROM edges WHERE resource=%s AND relation=%s AND subject=%s", values
+def mutate_many(conn, tenant, additions, removals):
+    conn.execute(
+        "INSERT INTO tenant_revision(tenant) VALUES (%s) ON CONFLICT DO NOTHING", (tenant,)
+    )
+    revision = conn.execute(
+        "SELECT value FROM tenant_revision WHERE tenant=%s FOR UPDATE", (tenant,)
+    ).fetchone()["value"]
+    changed = []
+    for edge in removals:
+        values = (tenant, edge.resource, edge.relation, edge.subject)
+        if conn.execute(
+            "DELETE FROM edges WHERE tenant=%s AND resource=%s AND relation=%s AND subject=%s",
+            values,
+        ).rowcount:
+            changed.append(("remove", edge))
+    for edge in additions:
+        if edge.relation in ("parent", "member") and would_cycle(
+            conn, tenant, edge.resource, edge.subject, edge.relation
+        ):
+            raise HTTPException(409, "Отношение создаёт цикл")
+        values = (tenant, edge.resource, edge.relation, edge.subject)
+        if conn.execute(
+            "INSERT INTO edges(tenant,resource,relation,subject) VALUES (%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+            values,
+        ).rowcount:
+            changed.append(("add", edge))
+    if changed:
+        revision = conn.execute(
+            "UPDATE tenant_revision SET value=value+1 WHERE tenant=%s RETURNING value", (tenant,)
+        ).fetchone()["value"]
+        with conn.cursor() as cursor:
+            cursor.executemany(
+                "INSERT INTO audit(tenant,revision,action,resource,relation,subject) VALUES (%s,%s,%s,%s,%s,%s)",
+                [
+                    (tenant, revision, action, e.resource, e.relation, e.subject)
+                    for action, e in changed
+                ],
             )
-        else:
-            edges = conn.execute(
-                "SELECT * FROM edges ORDER BY resource,relation,subject"
-            ).fetchall()
-            if edge.model_dump() not in edges:
-                if len(edges) >= 10000:
-                    raise HTTPException(409, "Лимит стенда: 10 000 отношений")
-                if edge.relation == "parent" and creates_cycle(edges, edge.resource, edge.subject):
-                    raise HTTPException(409, "Отношение создаёт цикл")
-            result = conn.execute(
-                "INSERT INTO edges VALUES (%s,%s,%s) ON CONFLICT DO NOTHING", values
-            )
-        if result.rowcount:
-            revision = conn.execute("UPDATE revision SET value=value+1 RETURNING value").fetchone()[
-                "value"
-            ]
     return {"revision": revision}
 
 
 @app.post("/relations")
-def add(edge: Edge):
-    return mutate(edge)
+def add(edge: Edge, tenant: str = Depends(authorize)):
+    with connect() as conn:
+        return mutate_many(conn, tenant, [edge], [])
 
 
 @app.delete("/relations")
-def remove(edge: Edge):
-    return mutate(edge, True)
+def remove(edge: Edge, tenant: str = Depends(authorize)):
+    with connect() as conn:
+        return mutate_many(conn, tenant, [], [edge])
+
+
+class Changes(BaseModel):
+    additions: list[Edge] = Field(default_factory=list, max_length=100)
+    removals: list[Edge] = Field(default_factory=list, max_length=100)
+
+
+@app.post("/relations/batch")
+def batch(body: Changes, tenant: str = Depends(authorize)):
+    with connect() as conn:
+        return mutate_many(conn, tenant, body.additions, body.removals)
+
+
+@app.get("/audit")
+def audit(
+    after: int = 0, limit: int = Query(default=100, ge=1, le=1000), tenant: str = Depends(authorize)
+):
+    with connect() as conn:
+        return conn.execute(
+            "SELECT * FROM audit WHERE tenant=%s AND id>%s ORDER BY id LIMIT %s",
+            (tenant, after, limit),
+        ).fetchall()
 
 
 @app.post("/check")
-def checks(body: Checks):
+def checks(body: Checks, tenant: str = Depends(authorize)):
     cache = redis.Redis.from_url(
         os.environ.get("REDIS_URL", "redis://localhost:6331/0"),
         socket_connect_timeout=0.1,
@@ -113,10 +157,16 @@ def checks(body: Checks):
     with connect() as conn:
         # Версия и отношения читаются из одного снимка первичной БД.
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        revision = conn.execute("SELECT value FROM revision WHERE singleton").fetchone()["value"]
+        conn.execute("SET LOCAL statement_timeout='2s'")
+        version = conn.execute(
+            "SELECT value FROM tenant_revision WHERE tenant=%s", (tenant,)
+        ).fetchone()
+        revision = version["value"] if version else 0
+        if revision < body.min_revision:
+            raise HTTPException(409, "Запрошенная версия ещё недоступна")
         namespace = hashlib.sha256(os.environ["DATABASE_URL"].encode()).hexdigest()[:16]
         digest = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
-        key = f"accessgraph:{namespace}:{revision}:{digest}"
+        key = f"accessgraph:v2:{namespace}:{tenant}:{revision}:{digest}"
         try:
             cached = cache.get(key)
             if cached:
@@ -124,11 +174,19 @@ def checks(body: Checks):
                 return json.loads(cached)
         except redis.RedisError:
             pass
-        edges = conn.execute("SELECT * FROM edges ORDER BY resource,relation,subject").fetchall()
+        try:
+            evaluated, visited = evaluate(conn, tenant, body.user, body.resources, body.permission)
+        except ValueError as exc:
+            raise HTTPException(413, str(exc)) from exc
+        except QueryCanceled as exc:
+            raise HTTPException(503, "Превышен бюджет проверки прав; решение не принято") from exc
         result = {
             "revision": revision,
-            "checks": {resource: check(edges, body.user, resource) for resource in body.resources},
+            "checks": evaluated,
+            "visited_edges": visited,
+            "permission": body.permission,
         }
+
     try:
         cache.setex(key, 60, json.dumps(result))
     except redis.RedisError:

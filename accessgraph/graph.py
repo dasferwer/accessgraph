@@ -1,16 +1,31 @@
 from collections import defaultdict, deque
 
 
-def check(edges, user, resource):
+def check(edges, user, resource, permission="view"):
     rights = defaultdict(list)
     parents = defaultdict(list)
     teams = set()
+    membership = defaultdict(set)
+    for edge in edges:
+        if edge["relation"] == "member":
+            membership[edge["subject"]].add(edge["resource"])
+    pending = [user]
+    while pending:
+        for team in membership[pending.pop()]:
+            if team not in teams:
+                teams.add(team)
+                pending.append(team)
+    allowed = {
+        "view": {"owner", "editor", "viewer"},
+        "edit": {"owner", "editor"},
+        "manage": {"owner"},
+    }[permission]
     for edge in edges:
         if edge["relation"] == "member" and edge["subject"] == user:
             teams.add(edge["resource"])
         elif edge["relation"] == "parent":
             parents[edge["resource"]].append(edge["subject"])
-        elif edge["relation"] in {"owner", "editor"}:
+        elif edge["relation"] in allowed:
             rights[edge["resource"]].append(edge)
     queue = deque([(resource, [resource])])
     visited = set()
