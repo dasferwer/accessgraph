@@ -1,0 +1,28 @@
+services:
+  database:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: accessgraph
+    ports: ["127.0.0.1:54831:5432"]
+    volumes: ["database:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d accessgraph"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7-alpine
+    ports: ["127.0.0.1:6331:6379"]
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://demo:demo@database/accessgraph
+      API_KEY: local-demo-key
+      REDIS_URL: redis://redis:6379/0
+    ports: ["127.0.0.1:8091:8000"]
+    depends_on:
+      database: {condition: service_healthy}
+volumes:
+  database:
