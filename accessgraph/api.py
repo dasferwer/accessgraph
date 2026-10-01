@@ -7,7 +7,7 @@ from typing import Literal
 
 import redis
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
-from psycopg.errors import QueryCanceled
+from psycopg.errors import LockNotAvailable, QueryCanceled
 from pydantic import BaseModel, Field, model_validator
 
 from accessgraph.db import connect, init
@@ -16,6 +16,7 @@ from accessgraph.repository import evaluate, would_cycle
 
 @asynccontextmanager
 async def lifespan(app):
+    mutation_timeouts()
     init()
     yield
 
@@ -72,7 +73,28 @@ class Checks(BaseModel):
         return self
 
 
+class MutationTimeouts(BaseModel):
+    statement_ms: int = Field(ge=1, le=30000)
+    lock_ms: int = Field(ge=1, le=10000)
+
+    @model_validator(mode="after")
+    def lock_budget(self):
+        if self.lock_ms >= self.statement_ms:
+            raise ValueError("Бюджет блокировки должен быть меньше SQL-бюджета")
+        return self
+
+
+def mutation_timeouts():
+    return MutationTimeouts(
+        statement_ms=os.environ.get("MUTATION_STATEMENT_TIMEOUT_MS", "2000"),
+        lock_ms=os.environ.get("MUTATION_LOCK_TIMEOUT_MS", "500"),
+    )
+
+
 def mutate_many(conn, tenant, additions, removals):
+    budgets = mutation_timeouts()
+    conn.execute("SELECT set_config('statement_timeout', %s, true)", (f"{budgets.statement_ms}ms",))
+    conn.execute("SELECT set_config('lock_timeout', %s, true)", (f"{budgets.lock_ms}ms",))
     conn.execute(
         "INSERT INTO tenant_revision(tenant) VALUES (%s) ON CONFLICT DO NOTHING", (tenant,)
     )
@@ -113,16 +135,24 @@ def mutate_many(conn, tenant, additions, removals):
     return {"revision": revision}
 
 
+def mutate(tenant, additions, removals):
+    try:
+        with connect() as conn:
+            return mutate_many(conn, tenant, additions, removals)
+    except LockNotAvailable as exc:
+        raise HTTPException(503, "Превышен бюджет ожидания блокировки; изменения отменены") from exc
+    except QueryCanceled as exc:
+        raise HTTPException(503, "Превышен SQL-бюджет мутации; изменения отменены") from exc
+
+
 @app.post("/relations")
 def add(edge: Edge, tenant: str = Depends(authorize)):
-    with connect() as conn:
-        return mutate_many(conn, tenant, [edge], [])
+    return mutate(tenant, [edge], [])
 
 
 @app.delete("/relations")
 def remove(edge: Edge, tenant: str = Depends(authorize)):
-    with connect() as conn:
-        return mutate_many(conn, tenant, [], [edge])
+    return mutate(tenant, [], [edge])
 
 
 class Changes(BaseModel):
@@ -132,8 +162,7 @@ class Changes(BaseModel):
 
 @app.post("/relations/batch")
 def batch(body: Changes, tenant: str = Depends(authorize)):
-    with connect() as conn:
-        return mutate_many(conn, tenant, body.additions, body.removals)
+    return mutate(tenant, body.additions, body.removals)
 
 
 @app.get("/audit")

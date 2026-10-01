@@ -22,6 +22,8 @@ services:
       API_KEY: local-demo-key
       TENANT_KEYS: ${TENANT_KEYS:-{}}
       REDIS_URL: redis://redis:6379/0
+      MUTATION_STATEMENT_TIMEOUT_MS: ${MUTATION_STATEMENT_TIMEOUT_MS:-2000}
+      MUTATION_LOCK_TIMEOUT_MS: ${MUTATION_LOCK_TIMEOUT_MS:-500}
     ports: ["127.0.0.1:8091:8000"]
     depends_on:
       database: {condition: service_healthy}
