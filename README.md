@@ -6,12 +6,14 @@
 
 ## Семантика
 
-- `folder:*` и `document:*` могут иметь `owner` или `editor`: пользователя либо команду.
-- `team:*` содержит пользователей через `member`. Вложенные команды не поддерживаются.
+- `folder:*` и `document:*` могут иметь `owner`, `editor` или `viewer`: пользователя либо команду.
+- `team:*` содержит пользователей и другие команды через `member`. Циклы членства запрещены.
 - Отношение `parent` связывает документ или папку с родительской папкой.
   Права распространяются вниз по всем родительским связям, но не вверх.
-- `POST /check` проверяет право редактирования. И владелец, и редактор получают его.
-  Неизвестный объект или пользователь получает отказ; явных запретов нет.
+- `POST /check` по умолчанию проверяет просмотр (`permission: "view"`). Для редактирования
+  передайте `"edit"`, для управления — `"manage"`. `viewer` даёт просмотр, `editor` —
+  просмотр и редактирование, `owner` — все три разрешения.
+  Пользователь без подходящего отношения получает отказ; явных запретов нет.
 - Циклы запрещены. Мутации сериализуются блокировкой строки версии в PostgreSQL,
   поэтому две конкурентные операции не могут по отдельности пройти проверку
   и совместно создать цикл.
@@ -76,7 +78,7 @@ curl -X POST http://localhost:8091/relations \
   -d '{"resource":"document:readme","relation":"parent","subject":"folder:docs"}'
 curl -X POST http://localhost:8091/check \
   -H 'X-API-Key: local-demo-key' -H 'Content-Type: application/json' \
-  -d '{"user":"user:alice","resources":["document:readme","folder:docs"]}'
+  -d '{"user":"user:alice","resources":["document:readme","folder:docs"],"permission":"edit"}'
 curl -X DELETE http://localhost:8091/relations \
   -H 'X-API-Key: local-demo-key' -H 'Content-Type: application/json' \
   -d '{"resource":"folder:docs","relation":"owner","subject":"user:alice"}'
